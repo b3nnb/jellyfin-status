@@ -12,7 +12,7 @@
   }
   .card {
     background: #141414; border: 1px solid #222; border-radius: 16px; padding: 2rem;
-    width: 100%; max-width: 460px;
+    width: 100%; max-width: 480px;
   }
   h1 { font-size: 1.25rem; font-weight: 600; margin-bottom: 1.5rem; display: flex; align-items: center; gap: .5rem; }
   .row {
@@ -31,62 +31,150 @@
   .verdict.warn { background: #f59e0b1a; color: #f59e0b; }
   .verdict.down { background: #ef44441a; color: #ef4444; }
   .footer { margin-top: 1.5rem; font-size: .7rem; color: #444; text-align: center; }
-  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #444; border-top-color: #888; border-radius: 50%; animation: spin .6s linear infinite; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #444; border-top-color: #888; border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; }
   @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>🎬 Jellyfin Status</h1>
+
   <div class="row">
-    <span class="label">Server (popcorn.bennbot.io)</span>
+    <span class="label">Reverse Proxy (Caddy)</span>
     <span>
-      <div class="value" id="pub-status" style="color:#666"><span class="spinner"></span> Checking…</div>
-      <div class="detail" id="pub-detail"></div>
+      <div class="value" id="caddy-status" style="color:#666"><span class="spinner"></span> Checking…</div>
+      <div class="detail" id="caddy-detail"></div>
     </span>
   </div>
+
+  <div class="row">
+    <span class="label">Jellyfin Server</span>
+    <span>
+      <div class="value" id="jf-status" style="color:#666"><span class="spinner"></span> Checking…</div>
+      <div class="detail" id="jf-detail"></div>
+    </span>
+  </div>
+
   <div class="verdict" id="verdict" style="background:#222; color:#666">Checking server status…</div>
   <div class="footer" id="footer">Last check: — · auto-refresh 30s</div>
 </div>
 <script>
-const JELLYFIN_URL = "https://popcorn.bennbot.io/System/Info/Public";
+const CADDY_URL = "https://popcorn.bennbot.io/healthz";
+const JF_URL = "https://popcorn.bennbot.io/System/Info/Public";
 const TIMEOUT_MS = 10000;
 
-async function checkServer() {
-  const pubEl = document.getElementById("pub-status");
-  const pubDetail = document.getElementById("pub-detail");
-  const verdictEl = document.getElementById("verdict");
-  const footerEl = document.getElementById("footer");
-
-  pubEl.innerHTML = '<span class="spinner"></span> Checking…';
-  pubEl.style.color = "#666";
-  pubDetail.textContent = "";
-
+async function fetchWithTimeout(url, opts = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   const start = performance.now();
-
   try {
-    // no-cors: response is opaque but promise resolving = server reachable
-    await fetch(JELLYFIN_URL, { mode: "no-cors", signal: controller.signal, cache: "no-store" });
+    const resp = await fetch(url, { ...opts, signal: controller.signal, cache: "no-store" });
     const ms = Math.round(performance.now() - start);
     clearTimeout(timer);
-
-    pubEl.textContent = "🟢 UP";
-    pubEl.style.color = "#22c55e";
-    pubDetail.textContent = ms + "ms";
-
-    verdictEl.textContent = "✅ Jellyfin is up — go watch something!";
-    verdictEl.className = "verdict ok";
+    return { ok: resp.ok, status: resp.status, ms, resp };
   } catch (e) {
     clearTimeout(timer);
     const ms = Math.round(performance.now() - start);
+    return { ok: false, status: 0, ms, error: e.name === "AbortError" ? "timeout" : "unreachable" };
+  }
+}
 
-    pubEl.textContent = "🔴 DOWN";
-    pubEl.style.color = "#ef4444";
-    pubDetail.textContent = ms + "ms timeout";
+async function checkAll() {
+  const caddyEl = document.getElementById("caddy-status");
+  const caddyDetail = document.getElementById("caddy-detail");
+  const jfEl = document.getElementById("jf-status");
+  const jfDetail = document.getElementById("jf-detail");
+  const verdictEl = document.getElementById("verdict");
+  const footerEl = document.getElementById("footer");
 
-    verdictEl.textContent = "🔴 Jellyfin is unreachable — Benn's been alerted. Check back soon.";
+  caddyEl.innerHTML = '<span class="spinner"></span> Checking…';
+  caddyEl.style.color = "#666";
+  caddyDetail.textContent = "";
+  jfEl.innerHTML = '<span class="spinner"></span> Checking…';
+  jfEl.style.color = "#666";
+  jfDetail.textContent = "";
+
+  // Check Caddy first (no-cors — just need to know if it's reachable)
+  const caddy = await fetchWithTimeout(CADDY_URL, { mode: "no-cors" });
+
+  let caddyUp = false;
+  if (caddy.ok || caddy.status > 0) {
+    // no-cors: any response (even opaque) means Caddy is reachable
+    // status 0 with no error = opaque response (no-cors mode)
+    caddyUp = caddy.error !== "timeout" && caddy.error !== "unreachable";
+  }
+
+  if (caddyUp) {
+    caddyEl.textContent = "🟢 UP";
+    caddyEl.style.color = "#22c55e";
+    caddyDetail.textContent = caddy.ms + "ms";
+  } else {
+    caddyEl.textContent = "🔴 DOWN";
+    caddyEl.style.color = "#ef4444";
+    caddyDetail.textContent = caddy.error || "unreachable";
+  }
+
+  // Check Jellyfin through Caddy (cors mode — can read status code now)
+  let jfUp = false;
+  let jfReason = "";
+
+  if (!caddyUp) {
+    // Caddy is down, no point checking Jellyfin through it
+    jfEl.textContent = "⚫ UNKNOWN";
+    jfEl.style.color = "#666";
+    jfDetail.textContent = "can't reach — proxy is down";
+  } else {
+    const jf = await fetchWithTimeout(JF_URL, { mode: "cors" });
+
+    if (jf.error) {
+      // Network error or CORS blocked — could be CORS failure or actual network issue
+      // Try no-cors fallback to see if something is listening
+      const jfFallback = await fetchWithTimeout(JF_URL, { mode: "no-cors" });
+      if (!jfFallback.error) {
+        // Something responded but CORS failed — likely a 502 from Caddy (backend down)
+        // Caddy returns 502 without our CORS header when the backend is unreachable
+        jfUp = false;
+        jfReason = "backend unreachable (502)";
+        jfEl.textContent = "🔴 DOWN";
+        jfEl.style.color = "#ef4444";
+        jfDetail.textContent = "Caddy can't reach Jellyfin — Nebula or process issue";
+      } else {
+        jfUp = false;
+        jfReason = "unreachable";
+        jfEl.textContent = "🔴 DOWN";
+        jfEl.style.color = "#ef4444";
+        jfDetail.textContent = jf.error;
+      }
+    } else if (jf.ok) {
+      // 200 — Jellyfin is up
+      jfUp = true;
+      jfEl.textContent = "🟢 UP";
+      jfEl.style.color = "#22c55e";
+      try {
+        const data = await jf.resp.json();
+        jfDetail.textContent = caddy.ms + "ms · v" + (data.Version || "?");
+      } catch {
+        jfDetail.textContent = jf.ms + "ms";
+      }
+    } else {
+      // Got a response but not 200 — likely 502
+      jfUp = false;
+      jfReason = "HTTP " + jf.status;
+      jfEl.textContent = "🔴 DOWN";
+      jfEl.style.color = "#ef4444";
+      jfDetail.textContent = "HTTP " + jf.status + " — backend unreachable";
+    }
+  }
+
+  // Verdict
+  if (caddyUp && jfUp) {
+    verdictEl.textContent = "✅ All good — Jellyfin is up and reachable!";
+    verdictEl.className = "verdict ok";
+  } else if (caddyUp && !jfUp) {
+    verdictEl.textContent = "⚠️ Reverse proxy is up but Jellyfin is down — Benn's been alerted";
+    verdictEl.className = "verdict warn";
+  } else {
+    verdictEl.textContent = "🔴 Server is unreachable — Benn's been alerted. Check back soon.";
     verdictEl.className = "verdict down";
   }
 
@@ -94,8 +182,8 @@ async function checkServer() {
   footerEl.textContent = "Last check: " + now + " PT · auto-refresh 30s";
 }
 
-checkServer();
-setInterval(checkServer, 30000);
+checkAll();
+setInterval(checkAll, 30000);
 </script>
 </body>
 </html>
