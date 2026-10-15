@@ -63,19 +63,34 @@ const CADDY_URL = "https://popcorn.bennbot.io/healthz";
 const JF_URL = "https://popcorn.bennbot.io/System/Info/Public";
 const TIMEOUT_MS = 10000;
 
-async function fetchWithTimeout(url, opts = {}) {
+// Returns: { reachable: bool, status: int (0=opaque/error), ms: int, error: string|null, body: any }
+async function probe(url, useCors) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   const start = performance.now();
   try {
-    const resp = await fetch(url, { ...opts, signal: controller.signal, cache: "no-store" });
+    const resp = await fetch(url, {
+      mode: useCors ? "cors" : "no-cors",
+      signal: controller.signal,
+      cache: "no-store"
+    });
     const ms = Math.round(performance.now() - start);
     clearTimeout(timer);
-    return { ok: resp.ok, status: resp.status, ms, resp };
+
+    // With no-cors: resp is opaque, status=0, ok=false — but NO throw means server responded
+    // With cors: resp is readable, status is real
+    if (!useCors) {
+      return { reachable: true, status: 0, ms, error: null };
+    }
+    // CORS mode — can read status and body
+    let body = null;
+    try { body = await resp.json(); } catch {}
+    return { reachable: true, status: resp.status, ms, error: null, body };
   } catch (e) {
     clearTimeout(timer);
     const ms = Math.round(performance.now() - start);
-    return { ok: false, status: 0, ms, error: e.name === "AbortError" ? "timeout" : "unreachable" };
+    const aborted = e.name === "AbortError";
+    return { reachable: false, status: 0, ms, error: aborted ? "timeout" : "network error" };
   }
 }
 
@@ -94,15 +109,9 @@ async function checkAll() {
   jfEl.style.color = "#666";
   jfDetail.textContent = "";
 
-  // Check Caddy first (no-cors — just need to know if it's reachable)
-  const caddy = await fetchWithTimeout(CADDY_URL, { mode: "no-cors" });
-
-  let caddyUp = false;
-  if (caddy.ok || caddy.status > 0) {
-    // no-cors: any response (even opaque) means Caddy is reachable
-    // status 0 with no error = opaque response (no-cors mode)
-    caddyUp = caddy.error !== "timeout" && caddy.error !== "unreachable";
-  }
+  // 1. Check Caddy alive (no-cors — any response = Caddy is running)
+  const caddy = await probe(CADDY_URL, false);
+  const caddyUp = caddy.reachable;
 
   if (caddyUp) {
     caddyEl.textContent = "🟢 UP";
@@ -111,67 +120,57 @@ async function checkAll() {
   } else {
     caddyEl.textContent = "🔴 DOWN";
     caddyEl.style.color = "#ef4444";
-    caddyDetail.textContent = caddy.error || "unreachable";
+    caddyDetail.textContent = caddy.error;
   }
 
-  // Check Jellyfin through Caddy (cors mode — can read status code now)
+  // 2. Check Jellyfin through Caddy (cors — can read actual status code)
   let jfUp = false;
-  let jfReason = "";
+  let jfVersion = null;
 
   if (!caddyUp) {
-    // Caddy is down, no point checking Jellyfin through it
     jfEl.textContent = "⚫ UNKNOWN";
     jfEl.style.color = "#666";
     jfDetail.textContent = "can't reach — proxy is down";
   } else {
-    const jf = await fetchWithTimeout(JF_URL, { mode: "cors" });
+    const jf = await probe(JF_URL, true);
 
-    if (jf.error) {
-      // Network error or CORS blocked — could be CORS failure or actual network issue
-      // Try no-cors fallback to see if something is listening
-      const jfFallback = await fetchWithTimeout(JF_URL, { mode: "no-cors" });
-      if (!jfFallback.error) {
-        // Something responded but CORS failed — likely a 502 from Caddy (backend down)
-        // Caddy returns 502 without our CORS header when the backend is unreachable
+    if (!jf.reachable) {
+      // CORS fetch threw — could be a CORS failure on an error response (e.g. 502)
+      // or a genuine network issue. Try no-cors fallback to see if something responds.
+      const fallback = await probe(JF_URL, false);
+      if (fallback.reachable) {
+        // Something responded but CORS mode failed — likely 502 (Caddy up, backend down)
         jfUp = false;
-        jfReason = "backend unreachable (502)";
         jfEl.textContent = "🔴 DOWN";
         jfEl.style.color = "#ef4444";
-        jfDetail.textContent = "Caddy can't reach Jellyfin — Nebula or process issue";
+        jfDetail.textContent = "Caddy can't reach Jellyfin (502)";
       } else {
         jfUp = false;
-        jfReason = "unreachable";
         jfEl.textContent = "🔴 DOWN";
         jfEl.style.color = "#ef4444";
         jfDetail.textContent = jf.error;
       }
-    } else if (jf.ok) {
-      // 200 — Jellyfin is up
+    } else if (jf.status === 200) {
       jfUp = true;
+      if (jf.body && jf.body.Version) jfVersion = jf.body.Version;
       jfEl.textContent = "🟢 UP";
       jfEl.style.color = "#22c55e";
-      try {
-        const data = await jf.resp.json();
-        jfDetail.textContent = caddy.ms + "ms · v" + (data.Version || "?");
-      } catch {
-        jfDetail.textContent = jf.ms + "ms";
-      }
+      jfDetail.textContent = jf.ms + "ms" + (jfVersion ? " · v" + jfVersion : "");
     } else {
-      // Got a response but not 200 — likely 502
+      // Got a status code but not 200 (e.g. 502, 503)
       jfUp = false;
-      jfReason = "HTTP " + jf.status;
       jfEl.textContent = "🔴 DOWN";
       jfEl.style.color = "#ef4444";
       jfDetail.textContent = "HTTP " + jf.status + " — backend unreachable";
     }
   }
 
-  // Verdict
+  // 3. Verdict
   if (caddyUp && jfUp) {
     verdictEl.textContent = "✅ All good — Jellyfin is up and reachable!";
     verdictEl.className = "verdict ok";
   } else if (caddyUp && !jfUp) {
-    verdictEl.textContent = "⚠️ Reverse proxy is up but Jellyfin is down — Benn's been alerted";
+    verdictEl.textContent = "⚠️ Proxy is up but Jellyfin is down — Benn's been alerted";
     verdictEl.className = "verdict warn";
   } else {
     verdictEl.textContent = "🔴 Server is unreachable — Benn's been alerted. Check back soon.";
