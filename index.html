@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jellyfin Status · popcorn.bennbot.io</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a0a; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    display: flex; justify-content: center; align-items: center; min-height: 100vh;
+  }
+  .card {
+    background: #141414; border: 1px solid #222; border-radius: 16px; padding: 2rem;
+    width: 100%; max-width: 460px;
+  }
+  h1 { font-size: 1.25rem; font-weight: 600; margin-bottom: 1.5rem; display: flex; align-items: center; gap: .5rem; }
+  .row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: .75rem 0; border-bottom: 1px solid #1a1a1a;
+  }
+  .row:last-of-type { border-bottom: none; }
+  .label { font-size: .85rem; color: #888; }
+  .value { font-size: .85rem; font-weight: 600; }
+  .detail { font-size: .75rem; color: #666; margin-top: 2px; }
+  .verdict {
+    margin-top: 1.25rem; padding: .75rem 1rem; border-radius: 8px;
+    font-size: .85rem; font-weight: 500; text-align: center;
+  }
+  .verdict.ok { background: #22c55e1a; color: #22c55e; }
+  .verdict.warn { background: #f59e0b1a; color: #f59e0b; }
+  .verdict.down { background: #ef44441a; color: #ef4444; }
+  .footer { margin-top: 1.5rem; font-size: .7rem; color: #444; text-align: center; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #444; border-top-color: #888; border-radius: 50%; animation: spin .6s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🎬 Jellyfin Status</h1>
+  <div class="row">
+    <span class="label">Server (popcorn.bennbot.io)</span>
+    <span>
+      <div class="value" id="pub-status" style="color:#666"><span class="spinner"></span> Checking…</div>
+      <div class="detail" id="pub-detail"></div>
+    </span>
+  </div>
+  <div class="verdict" id="verdict" style="background:#222; color:#666">Checking server status…</div>
+  <div class="footer" id="footer">Last check: — · auto-refresh 30s</div>
+</div>
+<script>
+const JELLYFIN_URL = "https://popcorn.bennbot.io/System/Info/Public";
+const TIMEOUT_MS = 10000;
+
+async function checkServer() {
+  const pubEl = document.getElementById("pub-status");
+  const pubDetail = document.getElementById("pub-detail");
+  const verdictEl = document.getElementById("verdict");
+  const footerEl = document.getElementById("footer");
+
+  pubEl.innerHTML = '<span class="spinner"></span> Checking…';
+  pubEl.style.color = "#666";
+  pubDetail.textContent = "";
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const start = performance.now();
+
+  try {
+    // no-cors: response is opaque but promise resolving = server reachable
+    await fetch(JELLYFIN_URL, { mode: "no-cors", signal: controller.signal, cache: "no-store" });
+    const ms = Math.round(performance.now() - start);
+    clearTimeout(timer);
+
+    pubEl.textContent = "🟢 UP";
+    pubEl.style.color = "#22c55e";
+    pubDetail.textContent = ms + "ms";
+
+    verdictEl.textContent = "✅ Jellyfin is up — go watch something!";
+    verdictEl.className = "verdict ok";
+  } catch (e) {
+    clearTimeout(timer);
+    const ms = Math.round(performance.now() - start);
+
+    pubEl.textContent = "🔴 DOWN";
+    pubEl.style.color = "#ef4444";
+    pubDetail.textContent = ms + "ms timeout";
+
+    verdictEl.textContent = "🔴 Jellyfin is unreachable — Benn's been alerted. Check back soon.";
+    verdictEl.className = "verdict down";
+  }
+
+  const now = new Date().toLocaleTimeString("en-US", { timeZone: "America/Los_Angeles", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  footerEl.textContent = "Last check: " + now + " PT · auto-refresh 30s";
+}
+
+checkServer();
+setInterval(checkServer, 30000);
+</script>
+</body>
+</html>
